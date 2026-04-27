@@ -1,22 +1,17 @@
 import requests
 import json
-import re
 import os
+import xml.etree.ElementTree as ET
 
 ACCOUNTS = ["drop_kr", "grainy.fm", "kpopssed1"]
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 STATE_FILE = "state.json"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Upgrade-Insecure-Requests": "1",
-}
+RSSHUB_INSTANCES = [
+    "https://rsshub.app",
+    "https://rss.shab.fun",
+    "https://rsshub.rssforever.com",
+]
 
 
 def load_state():
@@ -33,63 +28,49 @@ def save_state(state):
 
 
 def fetch_latest_video(username):
-    url = f"https://www.tiktok.com/@{username}"
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    try:
-        resp = session.get(url, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[{username}] 要請 失敗: {e}")
-        return None
-
-    html = resp.text
-
-    for pattern in [
-        r'<script id="SIGI_STATE"[^>]*>(.*?)<\/script>',
-        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)<\/script>',
-    ]:
-        m = re.search(pattern, html, re.DOTALL)
-        if not m:
-            continue
+    for base in RSSHUB_INSTANCES:
+        url = f"{base}/tiktok/user/@{username}"
         try:
-            data = json.loads(m.group(1))
-        except json.JSONDecodeError:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
+                continue
+
+            root = ET.fromstring(resp.text)
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+            # RSS 2.0
+            items = root.findall(".//item")
+            if items:
+                item = items[0]
+                title = item.findtext("title") or ""
+                link = item.findtext("link") or ""
+                guid = item.findtext("guid") or link
+                video_id = guid.rstrip("/").split("/")[-1]
+                print(f"[{username}] RSS OK ({base}): {title[:50]}")
+                return {"id": video_id, "desc": title, "url": link}
+
+            # Atom
+            entries = root.findall("atom:entry", ns)
+            if entries:
+                entry = entries[0]
+                title = entry.findtext("atom:title", namespaces=ns) or ""
+                link_el = entry.find("atom:link", ns)
+                link = link_el.attrib.get("href", "") if link_el is not None else ""
+                video_id = link.rstrip("/").split("/")[-1]
+                print(f"[{username}] Atom OK ({base}): {title[:50]}")
+                return {"id": video_id, "desc": title, "url": link}
+
+        except Exception as e:
+            print(f"[{username}] {base} 실패: {e}")
             continue
 
-        items = data.get("ItemModule", {})
-        if items:
-            sorted_items = sorted(
-                items.values(),
-                key=lambda x: int(x.get("createTime", 0)),
-                reverse=True,
-            )
-            if sorted_items:
-                v = sorted_items[0]
-                return {
-                    "id": v.get("id", ""),
-                    "desc": v.get("desc", ""),
-                    "url": f"https://www.tiktok.com/@{username}/video/{v.get('id', '')}",
-                }
-
-        scope = data.get("__DEFAULT_SCOPE__", {})
-        item_list = scope.get("webapp.user-post", {}).get("itemList", [])
-        if item_list:
-            v = item_list[0]
-            return {
-                "id": v.get("id", ""),
-                "desc": v.get("desc", ""),
-                "url": f"https://www.tiktok.com/@{username}/video/{v.get('id', '')}",
-            }
-
-    print(f"[{username}] 小数 欠些數據")
+    print(f"[{username}] 모든 RSS 인스턴스 실패")
     return None
 
 
 def send_slack(username, video):
     if not SLACK_WEBHOOK_URL:
-        print("SLACK_WEBHOOK_URL not set")
+        print("SLACK_WEBHOOK_URL이 설정되지 않았습니다")
         return
 
     payload = {
